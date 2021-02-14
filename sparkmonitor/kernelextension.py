@@ -14,12 +14,16 @@ from threading import Thread
 
 import pkg_resources
 
+
 ipykernel_imported = True
 spark_imported = True
+
+
 try:
     from ipykernel import zmqshell
 except ImportError:
     ipykernel_imported = False
+
 
 try:
     from pyspark import SparkConf
@@ -41,6 +45,7 @@ class ScalaMonitor:
         ipython is the instance of ZMQInteractiveShell
         """
         self.ipython = ipython
+        self.logger = logging.getLogger('sparkmonitorkernel')
         self.comm = None
 
     def start(self):
@@ -57,26 +62,26 @@ class ScalaMonitor:
         if self.comm:
             self.comm.send(msg)
         else:
-            logger.error("Comm channel with kernel NOT initialized. Is frontend extension enabled?")
-            logger.info("Lost message: %r", msg)
+            self.logger.error("Comm channel with kernel NOT initialized. Is frontend extension enabled?")
+            self.logger.info("Lost message: %r", msg)
 
     def handle_comm_message(self, msg):
         """Handle message received from frontend
 
         Does nothing for now as this only works if kernel is not busy.
         """
-        logger.info('COMM MESSAGE:  \n %s', str(msg))
+        self.logger.info('COMM MESSAGE:  \n %s', str(msg))
 
     def register_comm(self):
         """Register a comm_target which will be used by
         frontend to start communication."""
-        logger.debug("Registering comm target for SparkMonitor")
+        self.logger.debug("Registering comm target for SparkMonitor")
         self.ipython.kernel.comm_manager.register_target(
             'SparkMonitor', self.target_func)
 
     def target_func(self, comm, msg):
         """Callback function to be called when a frontend comm is opened"""
-        logger.info('COMM OPENED MESSAGE: \n %s \n', str(msg))
+        self.logger.info('COMM OPENED MESSAGE: \n %s \n', str(msg))
         self.comm = comm
 
         @self.comm.on_msg
@@ -92,6 +97,7 @@ class SocketThread(Thread):
     def __init__(self):
         """Constructor, initializes base class Thread."""
         self.port = 0
+        self.logger = logging.getLogger('sparkmonitorkernel')
         Thread.__init__(self)
 
     def startSocket(self):
@@ -101,7 +107,7 @@ class SocketThread(Thread):
         self.sock.bind(('localhost', self.port))
         self.sock.listen(5)
         self.port = self.sock.getsockname()[1]
-        logger.info('Socket Listening on port %s', str(self.port))
+        self.logger.info('Socket Listening on port %s', str(self.port))
         self.start()
         return self.port
 
@@ -112,14 +118,14 @@ class SocketThread(Thread):
         When a connection is closed, goes back into waiting.
         """
         while(True):
-            logger.info('Starting socket thread, going to accept')
+            self.logger.info('Starting socket thread, going to accept')
             (client, addr) = self.sock.accept()
-            logger.info('Client Connected %s', addr)
+            self.logger.info('Client Connected %s', addr)
             totalMessage = ''
             while True:
                 messagePart = client.recv(4096)
                 if not messagePart:
-                    logger.info('Scala socket closed - empty data')
+                    self.logger.info('Scala socket closed - empty data')
                     break
                 totalMessage += messagePart.decode()
                 # Messages are ended with ;EOD:
@@ -127,9 +133,9 @@ class SocketThread(Thread):
                 totalMessage = pieces[-1]
                 messages = pieces[:-1]
                 for msg in messages:
-                    logger.info('Message Received: \n%s\n', msg)
+                    self.logger.info('Message Received: \n%s\n', msg)
                     self.onrecv(msg)
-            logger.info('Socket Exiting Client Loop')
+            self.logger.info('Socket Exiting Client Loop')
             try:
                 client.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -158,7 +164,6 @@ def load_ipython_extension(ipython):
     """
     global ip, monitor  # For Debugging
 
-    global logger
     logger = logging.getLogger('sparkmonitorkernel')
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
@@ -183,7 +188,7 @@ def load_ipython_extension(ipython):
     logger.info('Starting Kernel Extension')
     monitor = ScalaMonitor(ip)
     monitor.register_comm()  # Communication to browser
-    monitor.start()
+    port = monitor.start()
 
     # Injecting conf into users namespace
     if spark_imported:
@@ -192,34 +197,33 @@ def load_ipython_extension(ipython):
         if conf:
             logger.info('Conf: ' + conf.toDebugString())
             if isinstance(conf, SparkConf):
-                configure(conf)
+                configure(conf, port)
         else:
             conf = SparkConf()  # Create a new conf
-            configure(conf)
+            configure(conf, port)
             ipython.push({'conf': conf})  # Add to users namespace
 
 
 def unload_ipython_extension(ipython):
     """Called when extension is unloaded TODO if any"""
+    logger = logging.getLogger('sparkmonitorkernel')
     logger.info('Extension Unloaded')
-    pass
 
 
-def configure(conf):
+def configure(conf, port):
     """Configures the provided conf object.
 
     Sets the Java Classpath and listener jar file path to "conf".
     Also sets an environment variable for ports for communication
     with scala listener.
     """
-    global monitor
-    port = monitor.getPort()
-    print('SparkConf Configured, Starting to listen on port:', str(port))
+    logger = logging.getLogger('sparkmonitorkernel')
+    logger.info('SparkConf Configured, Starting to listen on port:', str(port))
     os.environ['SPARKMONITOR_KERNEL_PORT'] = str(port)
-    logger.info(os.environ['SPARKMONITOR_KERNEL_PORT'])
+    logger.info('Set environment variable SPARKMONITOR_KERNEL_PORT to: %r', 
+                os.environ['SPARKMONITOR_KERNEL_PORT'])
     conf.set('spark.extraListeners',
              'sparkmonitor.listener.JupyterSparkMonitorListener')
-    # jarpath = os.path.abspath(os.path.dirname(__file__)) + '/listener.jar'
     jarpath = pkg_resources.resource_filename(__name__, '/listener.jar')
     logger.info('Adding jar from %s ', jarpath)
     print('JAR PATH:' + jarpath)
