@@ -41,6 +41,7 @@ class ScalaMonitor:
         ipython is the instance of ZMQInteractiveShell
         """
         self.ipython = ipython
+        self.comm = None
 
     def start(self):
         """Creates the socket thread and returns assigned port"""
@@ -53,7 +54,11 @@ class ScalaMonitor:
 
     def send(self, msg):
         """Send a message to the frontend"""
-        self.comm.send(msg)
+        if self.comm:
+            self.comm.send(msg)
+        else:
+            logger.error("Comm channel with kernel NOT initialized. Is frontend extension enabled?")
+            logger.info("Lost message: %r", msg)
 
     def handle_comm_message(self, msg):
         """Handle message received from frontend
@@ -65,6 +70,7 @@ class ScalaMonitor:
     def register_comm(self):
         """Register a comm_target which will be used by
         frontend to start communication."""
+        logger.debug("Registering comm target for SparkMonitor")
         self.ipython.kernel.comm_manager.register_target(
             'SparkMonitor', self.target_func)
 
