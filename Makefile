@@ -33,7 +33,8 @@ clean:
 	rm -rf lib
 
 .PHONY: lint
-lint: frontend-build
+lint: venv frontend-build
+	tox -e lint
 	./node_modules/.bin/eslint js/*.js --fix
 
 itest:

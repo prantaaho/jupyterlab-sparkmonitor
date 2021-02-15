@@ -15,14 +15,15 @@ from threading import Thread
 import pkg_resources
 
 
-ipykernel_imported = True
-spark_imported = True
+IPYKERNEL_IMPORTED = True
+SPARK_IMPORTED = True
+MONITOR = None
 
 
 try:
     from ipykernel import zmqshell
 except ImportError:
-    ipykernel_imported = False
+    IPYKERNEL_IMPORTED = False
 
 
 try:
@@ -31,9 +32,9 @@ except ImportError:
     try:
         import findspark
         findspark.init()
-        from pyspark import SparkConf
-    except Exception:
-        spark_imported = False
+        from pyspark import SparkConf  # pylint: disable=ungrouped-imports
+    except (ImportError, ValueError):
+        SPARK_IMPORTED = False
 
 
 class ScalaMonitor:
@@ -47,22 +48,20 @@ class ScalaMonitor:
         self.ipython = ipython
         self.logger = logging.getLogger('sparkmonitorkernel')
         self.comm = None
+        self.scala_socket = None
 
     def start(self):
         """Creates the socket thread and returns assigned port"""
-        self.scalaSocket = SocketThread()
-        return self.scalaSocket.startSocket()  # returns the port
-
-    def getPort(self):
-        """Return the socket port"""
-        return self.scalaSocket.port
+        self.scala_socket = SocketThread()
+        return self.scala_socket.start_socket()  # returns the port
 
     def send(self, msg):
         """Send a message to the frontend"""
         if self.comm:
             self.comm.send(msg)
         else:
-            self.logger.error("Comm channel with kernel NOT initialized. Is frontend extension enabled?")
+            self.logger.error(
+                "Comm channel with kernel NOT initialized. Is frontend extension enabled?")
             self.logger.info("Lost message: %r", msg)
 
     def handle_comm_message(self, msg):
@@ -97,10 +96,11 @@ class SocketThread(Thread):
     def __init__(self):
         """Constructor, initializes base class Thread."""
         self.port = 0
+        self.sock = None
         self.logger = logging.getLogger('sparkmonitorkernel')
         Thread.__init__(self)
 
-    def startSocket(self):
+    def start_socket(self):
         """Starts a socket on a random port and starts
         listening for connections"""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -117,20 +117,20 @@ class SocketThread(Thread):
         Creates a socket and waits(blocking) for connections
         When a connection is closed, goes back into waiting.
         """
-        while(True):
+        while True:
             self.logger.info('Starting socket thread, going to accept')
             (client, addr) = self.sock.accept()
             self.logger.info('Client Connected %s', addr)
-            totalMessage = ''
+            full_message = ''
             while True:
-                messagePart = client.recv(4096)
-                if not messagePart:
+                message_part = client.recv(4096)
+                if not message_part:
                     self.logger.info('Scala socket closed - empty data')
                     break
-                totalMessage += messagePart.decode()
+                full_message += message_part.decode()
                 # Messages are ended with ;EOD:
-                pieces = totalMessage.split(';EOD:')
-                totalMessage = pieces[-1]
+                pieces = full_message.split(';EOD:')
+                full_message = pieces[-1]
                 messages = pieces[:-1]
                 for msg in messages:
                     self.logger.info('Message Received: \n%s\n', msg)
@@ -145,16 +145,10 @@ class SocketThread(Thread):
         """Starts the socket thread"""
         Thread.start(self)
 
-    def sendToScala(self, msg):
-        """Send a message through the socket."""
-        return self.socket.send(msg)
-
-    def onrecv(self, msg):
+    @staticmethod
+    def onrecv(msg):
         """Forwards all messages to the frontend"""
-        sendToFrontEnd({
-            'msgtype': 'fromscala',
-            'msg': msg
-        })
+        send_to_frontend(msg)
 
 
 def load_ipython_extension(ipython):
@@ -162,40 +156,38 @@ def load_ipython_extension(ipython):
 
     ipython is the InteractiveShell instance
     """
-    global ip, monitor  # For Debugging
-
+    global MONITOR  # pylint: disable=global-statement
     logger = logging.getLogger('sparkmonitorkernel')
     logger.setLevel(logging.DEBUG)
-    logger.propagate = False
+    logger.propagate = True
     # For debugging this module - Writes logs to a file
-    fh = logging.FileHandler('sparkmonitor_kernelextension.log', mode='w')
-    fh.setLevel(logging.DEBUG)
+    file_handler = logging.FileHandler('sparkmonitor_kernelextension.log', mode='w')
+    file_handler.setLevel(logging.DEBUG)
     formatter = logging.Formatter(
         '%(levelname)s:  %(asctime)s - %(name)s - %(process)d - %(processName)s - \
         %(thread)d - %(threadName)s\n %(message)s \n')
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
-    if ipykernel_imported:
+    if IPYKERNEL_IMPORTED:
         if not isinstance(ipython, zmqshell.ZMQInteractiveShell):
-            logger.warn(
+            logger.warning(
                 'SparkMonitor: Ipython not running through notebook')
             return
     else:
         return
 
-    ip = ipython
     logger.info('Starting Kernel Extension')
-    monitor = ScalaMonitor(ip)
-    monitor.register_comm()  # Communication to browser
-    port = monitor.start()
+    MONITOR = ScalaMonitor(ipython)
+    MONITOR.register_comm()  # Communication to browser
+    port = MONITOR.start()
 
     # Injecting conf into users namespace
-    if spark_imported:
+    if SPARK_IMPORTED:
         # Get conf if user already has a conf for appending
         conf = ipython.user_ns.get('conf')
         if conf:
-            logger.info('Conf: ' + conf.toDebugString())
+            logger.info('Conf: %r', conf.toDebugString())
             if isinstance(conf, SparkConf):
                 configure(conf, port)
         else:
@@ -204,7 +196,7 @@ def load_ipython_extension(ipython):
             ipython.push({'conf': conf})  # Add to users namespace
 
 
-def unload_ipython_extension(ipython):
+def unload_ipython_extension(_ipython):
     """Called when extension is unloaded TODO if any"""
     logger = logging.getLogger('sparkmonitorkernel')
     logger.info('Extension Unloaded')
@@ -218,9 +210,9 @@ def configure(conf, port):
     with scala listener.
     """
     logger = logging.getLogger('sparkmonitorkernel')
-    logger.info('SparkConf Configured, Starting to listen on port:', str(port))
+    logger.info('SparkConf Configured, Starting to listen on port: %r', port)
     os.environ['SPARKMONITOR_KERNEL_PORT'] = str(port)
-    logger.info('Set environment variable SPARKMONITOR_KERNEL_PORT to: %r', 
+    logger.info('Set environment variable SPARKMONITOR_KERNEL_PORT to: %r',
                 os.environ['SPARKMONITOR_KERNEL_PORT'])
     conf.set('spark.extraListeners',
              'sparkmonitor.listener.JupyterSparkMonitorListener')
@@ -229,8 +221,9 @@ def configure(conf, port):
     print('JAR PATH:' + jarpath)
     conf.set('spark.driver.extraClassPath', jarpath)
 
-
-def sendToFrontEnd(msg):
-    """Send a message to the frontend through the singleton monitor object."""
-    global monitor
-    monitor.send(msg)
+def send_to_frontend(msg):
+    """Send a mesage to the frontend through the singleton monitor object."""
+    MONITOR.send({
+         'msg_type': 'fromscala',
+         'msg': msg
+    })
